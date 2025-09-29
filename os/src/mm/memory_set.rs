@@ -262,6 +262,31 @@ impl MemorySet {
             false
         }
     }
+
+    /// Remove a mapped framed area exactly matching [start_va, end_va).
+    /// Returns true on success, false if no exact area found.
+    pub fn remove_area_with_start_end(
+        &mut self,
+        start_va: VirtAddr,
+        end_va: VirtAddr,
+    ) -> bool {
+        let start_vpn = start_va.floor();
+        let end_vpn = end_va.ceil();
+        if let Some((idx, _)) = self
+            .areas
+            .iter()
+            .enumerate()
+            .find(|(_, area)| area.vpn_range.get_start() == start_vpn && area.vpn_range.get_end() == end_vpn)
+        {
+            // Unmap pages and drop frames held by the area
+            self.areas[idx].unmap(&mut self.page_table);
+            // Remove area record
+            self.areas.remove(idx);
+            true
+        } else {
+            false
+        }
+    }
 }
 /// map area structure, controls a contiguous piece of virtual memory
 pub struct MapArea {

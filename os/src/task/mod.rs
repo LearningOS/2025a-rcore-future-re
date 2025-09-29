@@ -202,3 +202,42 @@ pub fn current_trap_cx() -> &'static mut TrapContext {
 pub fn change_program_brk(size: i32) -> Option<usize> {
     TASK_MANAGER.change_current_program_brk(size)
 }
+
+/// Increase syscall count for current task by syscall id (bounded to array size)
+pub fn increase_syscall_times(syscall_id: usize) {
+    let mut inner = TASK_MANAGER.inner.exclusive_access();
+    let cur = inner.current_task;
+    if syscall_id < inner.tasks[cur].syscall_times.len() {
+        inner.tasks[cur].syscall_times[syscall_id] += 1;
+    }
+}
+
+/// Get syscall count for the given id of current task
+pub fn get_syscall_times(syscall_id: usize) -> usize {
+    let inner = TASK_MANAGER.inner.exclusive_access();
+    let cur = inner.current_task;
+    if syscall_id < inner.tasks[cur].syscall_times.len() {
+        inner.tasks[cur].syscall_times[syscall_id]
+    } else {
+        0
+    }
+}
+
+/// Map a framed area [start, end) into current task's address space with permissions
+pub fn current_mmap(start: usize, end: usize, perm: crate::mm::MapPermission) {
+    let mut inner = TASK_MANAGER.inner.exclusive_access();
+    let cur = inner.current_task;
+    inner.tasks[cur]
+        .memory_set
+        .insert_framed_area(start.into(), end.into(), perm);
+}
+
+/// Remove an exact mapped area [start, end) from current task's address space.
+/// Returns true on success.
+pub fn current_munmap(start: usize, end: usize) -> bool {
+    let mut inner = TASK_MANAGER.inner.exclusive_access();
+    let cur = inner.current_task;
+    inner.tasks[cur]
+        .memory_set
+        .remove_area_with_start_end(start.into(), end.into())
+}
