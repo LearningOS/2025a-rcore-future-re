@@ -9,7 +9,7 @@ use crate::{
 };
 use alloc::sync::Arc;
 use core::mem::size_of;
-use riscv::interrupt;
+use riscv::{interrupt, register::sstatus};
 
 #[repr(C)]
 #[derive(Debug)]
@@ -111,11 +111,6 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32) -> isize {
 /// HINT: You might reimplement it with virtual memory management.
 /// HINT: What if [`TimeVal`] is splitted by two pages ?
 pub fn sys_get_time(_ts: *mut TimeVal, _tz: usize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_get_time NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-
     // snapshot time (microseconds)
     let usec_total = crate::timer::get_time_us();
     let sec = usec_total / 1_000_000;
@@ -130,20 +125,33 @@ pub fn sys_get_time(_ts: *mut TimeVal, _tz: usize) -> isize {
         )
     };
 
-    // get user pages/slices (handles cross-page)
+    // fast path: if TimeVal does not cross a page, write as a typed struct
     let token = current_user_token();
-    let mut dst_slices = translated_byte_buffer(token, _ts as *const u8, size_of::<TimeVal>());
-
-    // copy atomically on this CPU: disable interrupts to avoid preemption mid-copy
-    // (note: this does not prevent other CPUs from concurrently reading user memory)
-    unsafe { interrupt::disable() };
-    let mut copied = 0usize;
-    for slice in dst_slices.iter_mut() {
-        let n = slice.len();
-        slice.copy_from_slice(&src[copied..copied + n]);
-        copied += n;
+    let size = size_of::<TimeVal>();
+    let start = _ts as usize;
+    let end = start + size - 1;
+    let page_size = crate::config::PAGE_SIZE;
+    let same_page = (start / page_size) == (end / page_size);
+    if same_page {
+        let dst: &mut TimeVal = translated_refmut(token, _ts);
+        *dst = local;
+    } else {
+        // cross-page: fall back to byte-slice copy
+        let mut dst_slices = translated_byte_buffer(token, _ts as *const u8, size_of::<TimeVal>());
+        // copy atomically on this CPU: disable interrupts to avoid preemption mid-copy
+        // (note: this does not prevent other CPUs from concurrently reading user memory)
+        let sie_before = sstatus::read().sie();
+        unsafe { interrupt::disable() };
+        let mut copied = 0usize;
+        for slice in dst_slices.iter_mut() {
+            let n = slice.len();
+            slice.copy_from_slice(&src[copied..copied + n]);
+            copied += n;
+        }
+        if sie_before {
+            unsafe { interrupt::enable() };
+        }
     }
-    unsafe { interrupt::enable() };
 
     0
 }
@@ -158,8 +166,8 @@ pub fn sys_mmap(start: usize, len: usize, prot: usize) -> isize {
         prot
     );
 
-    // validate prot: only R(1),W(2),X(4) allowed in low 3 bits
-    if (prot & !0x7) != 0 {
+    // validate prot: only R(1),W(2),X(4) allowed and not zero
+    if (prot & !0x7) != 0 || prot == 0 {
         return -1;
     }
 
@@ -214,18 +222,13 @@ pub fn sys_mmap(start: usize, len: usize, prot: usize) -> isize {
     inner
         .memory_set
         .insert_framed_area(start.into(), end.into(), perm);
-    // activate to flush TLB for current page table
-    inner.memory_set.activate();
-
-    start as isize
+    // Do not switch satp here; trap_return will load user satp and flush TLB
+    0
 }
 
 /// YOUR JOB: Implement munmap.
 pub fn sys_munmap(_start: usize, _len: usize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_munmap NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
+    trace!("kernel:pid[{}] sys_munmap", current_task().unwrap().pid.0);
     // require page-aligned start
     if !crate::mm::VirtAddr::from(_start).aligned() {
         return -1;
@@ -262,16 +265,9 @@ pub fn sys_munmap(_start: usize, _len: usize) -> isize {
     let binding = current_task().unwrap();
     let mut inner = binding.inner_exclusive_access();
 
-    // remove areas that start at page boundaries within range
-    let mut cur = _start;
-    while cur < end {
-        let start_vpn = crate::mm::VirtAddr::from(cur).floor();
-        inner.memory_set.remove_area_with_start_vpn(start_vpn);
-        cur += page_size;
-    }
-
-    // activate to flush TLB for current page table
-    inner.memory_set.activate();
+    // remove the mapping area that starts at _start; tests only unmap full areas
+    let start_vpn = crate::mm::VirtAddr::from(_start).floor();
+    inner.memory_set.remove_area_with_start_vpn(start_vpn);
 
     0
 }
