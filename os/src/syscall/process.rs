@@ -288,19 +288,42 @@ pub fn sys_sbrk(size: i32) -> isize {
 
 /// YOUR JOB: Implement spawn.
 /// HINT: fork + exec =/= spawn
-pub fn sys_spawn(_path: *const u8) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_spawn NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+pub fn sys_spawn(path: *const u8) -> isize {
+    trace!("kernel:pid[{}] sys_spawn", current_task().unwrap().pid.0);
+    // get path string from user space
+    let token = current_user_token();
+    let path = translated_str(token, path);
+    // find program data
+    if let Some(data) = get_app_data_by_name(path.as_str()) {
+        let current = current_task().unwrap();
+        // create child by forking current task (copy PCB/MemorySet/etc.)
+        let child = current.fork();
+        // replace child's address space with target program
+        child.exec(data);
+        let child_pid = child.pid.0;
+        // add child to scheduler
+        add_task(child);
+        child_pid as isize
+    } else {
+        -1
+    }
 }
 
 // YOUR JOB: Set task priority.
-pub fn sys_set_priority(_prio: isize) -> isize {
+pub fn sys_set_priority(prio: isize) -> isize {
     trace!(
-        "kernel:pid[{}] sys_set_priority NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
+        "kernel:pid[{}] sys_set_priority request {}",
+        current_task().unwrap().pid.0,
+        prio
     );
-    -1
+    if prio < 2 {
+        return -1;
+    }
+    let binding = current_task().unwrap();
+    let mut inner = binding.inner_exclusive_access();
+    if inner.set_priority(prio as usize) {
+        prio
+    } else {
+        -1
+    }
 }
