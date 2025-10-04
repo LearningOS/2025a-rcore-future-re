@@ -11,6 +11,8 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::cell::RefMut;
 
+pub const BIG_STRIDE: usize = 1 << 20; // 1048576
+
 /// Task control block structure
 ///
 /// Directly save the contents that will not change during running
@@ -52,6 +54,11 @@ pub struct TaskControlBlockInner {
     /// Maintain the execution status of the current process
     pub task_status: TaskStatus,
 
+    /// stride scheduling fields
+    pub priority: usize, // >= 2
+    pub stride: usize, // current accumulated stride (starts at 0)
+    pub pass: usize,   // increment per schedule = BIG_STRIDE / priority
+
     /// Application address space
     pub memory_set: MemorySet,
 
@@ -86,13 +93,21 @@ impl TaskControlBlockInner {
     pub fn is_zombie(&self) -> bool {
         self.get_status() == TaskStatus::Zombie
     }
-    pub fn alloc_fd(&mut self) -> usize {
-        if let Some(fd) = (0..self.fd_table.len()).find(|fd| self.fd_table[*fd].is_none()) {
-            fd
-        } else {
-            self.fd_table.push(None);
-            self.fd_table.len() - 1
+
+    pub fn init_stride_fields(&mut self) {
+        self.priority = 16;
+        self.stride = 0;
+        self.pass = BIG_STRIDE / self.priority;
+    }
+
+    pub fn set_priority(&mut self, prio: usize) -> bool {
+        if prio < 2 {
+            return false;
         }
+        self.priority = prio;
+        // recompute pass; avoid zero
+        self.pass = BIG_STRIDE / self.priority;
+        true
     }
 }
 
@@ -121,6 +136,9 @@ impl TaskControlBlock {
                     base_size: user_sp,
                     task_cx: TaskContext::goto_trap_return(kernel_stack_top),
                     task_status: TaskStatus::Ready,
+                    priority: 16,
+                    stride: 0,
+                    pass: BIG_STRIDE / 16,
                     memory_set,
                     parent: None,
                     children: Vec::new(),
@@ -209,6 +227,9 @@ impl TaskControlBlock {
                     base_size: parent_inner.base_size,
                     task_cx: TaskContext::goto_trap_return(kernel_stack_top),
                     task_status: TaskStatus::Ready,
+                    priority: parent_inner.priority,
+                    stride: 0,
+                    pass: BIG_STRIDE / parent_inner.priority,
                     memory_set,
                     parent: Some(Arc::downgrade(self)),
                     children: Vec::new(),
