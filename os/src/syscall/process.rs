@@ -1,14 +1,15 @@
 //! Process management syscalls
-use alloc::sync::Arc;
-
 use crate::{
     loader::get_app_data_by_name,
-    mm::{translated_refmut, translated_str},
+    mm::{translated_byte_buffer, translated_refmut, translated_str},
     task::{
         add_task, current_task, current_user_token, exit_current_and_run_next,
         suspend_current_and_run_next,
     },
 };
+use alloc::sync::Arc;
+use core::mem::size_of;
+use riscv::interrupt;
 
 #[repr(C)]
 #[derive(Debug)]
@@ -67,7 +68,11 @@ pub fn sys_exec(path: *const u8) -> isize {
 /// If there is not a child process whose pid is same as given, return -1.
 /// Else if there is a child process but it is still running, return -2.
 pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32) -> isize {
-    trace!("kernel::pid[{}] sys_waitpid [{}]", current_task().unwrap().pid.0, pid);
+    trace!(
+        "kernel::pid[{}] sys_waitpid [{}]",
+        current_task().unwrap().pid.0,
+        pid
+    );
     let task = current_task().unwrap();
     // find a child process
 
@@ -110,16 +115,109 @@ pub fn sys_get_time(_ts: *mut TimeVal, _tz: usize) -> isize {
         "kernel:pid[{}] sys_get_time NOT IMPLEMENTED",
         current_task().unwrap().pid.0
     );
-    -1
+
+    // snapshot time (microseconds)
+    let usec_total = crate::timer::get_time_us();
+    let sec = usec_total / 1_000_000;
+    let usec = (usec_total % 1_000_000) as usize;
+    let local = TimeVal { sec, usec };
+
+    // build byte slice of local struct
+    let src = unsafe {
+        core::slice::from_raw_parts(
+            (&local as *const TimeVal) as *const u8,
+            size_of::<TimeVal>(),
+        )
+    };
+
+    // get user pages/slices (handles cross-page)
+    let token = current_user_token();
+    let mut dst_slices = translated_byte_buffer(token, _ts as *const u8, size_of::<TimeVal>());
+
+    // copy atomically on this CPU: disable interrupts to avoid preemption mid-copy
+    // (note: this does not prevent other CPUs from concurrently reading user memory)
+    unsafe { interrupt::disable() };
+    let mut copied = 0usize;
+    for slice in dst_slices.iter_mut() {
+        let n = slice.len();
+        slice.copy_from_slice(&src[copied..copied + n]);
+        copied += n;
+    }
+    unsafe { interrupt::enable() };
+
+    0
 }
 
 /// YOUR JOB: Implement mmap.
-pub fn sys_mmap(_start: usize, _len: usize, _port: usize) -> isize {
+pub fn sys_mmap(start: usize, len: usize, prot: usize) -> isize {
     trace!(
-        "kernel:pid[{}] sys_mmap NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
+        "kernel:pid[{}] sys_mmap request: start={:#x} len={} prot={:#x}",
+        current_task().unwrap().pid.0,
+        start,
+        len,
+        prot
     );
-    -1
+
+    // validate prot: only R(1),W(2),X(4) allowed in low 3 bits
+    if (prot & !0x7) != 0 {
+        return -1;
+    }
+
+    // require page-aligned start (simple policy)
+    if !crate::mm::VirtAddr::from(start).aligned() {
+        return -1;
+    }
+
+    // round up length to page size
+    let page_size = crate::config::PAGE_SIZE;
+    let len_up = if len == 0 {
+        0
+    } else {
+        ((len - 1) / page_size + 1) * page_size
+    };
+    if len_up == 0 {
+        return -1;
+    }
+    let end = match start.checked_add(len_up) {
+        Some(e) => e,
+        None => return -1,
+    };
+
+    // check no existing mapping overlaps (use a snapshot of current page table)
+    let page_table = crate::mm::PageTable::from_token(current_user_token());
+    let mut va = start;
+    while va < end {
+        let vpn = crate::mm::VirtAddr::from(va).floor();
+        if let Some(pte) = page_table.translate(vpn) {
+            if pte.is_valid() {
+                return -1;
+            }
+        }
+        va += page_size;
+    }
+
+    // build MapPermission (always include user bit)
+    let mut perm = crate::mm::MapPermission::U;
+    if (prot & 0x1) != 0 {
+        perm |= crate::mm::MapPermission::R;
+    }
+    if (prot & 0x2) != 0 {
+        perm |= crate::mm::MapPermission::W;
+    }
+    if (prot & 0x4) != 0 {
+        perm |= crate::mm::MapPermission::X;
+    }
+
+    // perform mapping in current task's MemorySet
+    let binding = current_task().unwrap();
+    let mut inner = binding.inner_exclusive_access();
+    inner
+        .memory_set
+        .insert_framed_area(start.into(), end.into(), perm);
+    // activate to flush TLB for current page table
+    inner.memory_set.activate();
+
+    start as isize
 }
 
 /// YOUR JOB: Implement munmap.
@@ -128,7 +226,54 @@ pub fn sys_munmap(_start: usize, _len: usize) -> isize {
         "kernel:pid[{}] sys_munmap NOT IMPLEMENTED",
         current_task().unwrap().pid.0
     );
-    -1
+    // require page-aligned start
+    if !crate::mm::VirtAddr::from(_start).aligned() {
+        return -1;
+    }
+
+    // round up length to page size
+    let page_size = crate::config::PAGE_SIZE;
+    let len_up = if _len == 0 {
+        0
+    } else {
+        ((_len - 1) / page_size + 1) * page_size
+    };
+    if len_up == 0 {
+        return -1;
+    }
+    let end = match _start.checked_add(len_up) {
+        Some(e) => e,
+        None => return -1,
+    };
+
+    // verify range is fully mapped in current page table snapshot
+    let page_table = crate::mm::PageTable::from_token(current_user_token());
+    let mut va = _start;
+    while va < end {
+        let vpn = crate::mm::VirtAddr::from(va).floor();
+        match page_table.translate(vpn) {
+            Some(pte) if pte.is_valid() => {}
+            _ => return -1,
+        }
+        va += page_size;
+    }
+
+    // perform unmap in current task's MemorySet
+    let binding = current_task().unwrap();
+    let mut inner = binding.inner_exclusive_access();
+
+    // remove areas that start at page boundaries within range
+    let mut cur = _start;
+    while cur < end {
+        let start_vpn = crate::mm::VirtAddr::from(cur).floor();
+        inner.memory_set.remove_area_with_start_vpn(start_vpn);
+        cur += page_size;
+    }
+
+    // activate to flush TLB for current page table
+    inner.memory_set.activate();
+
+    0
 }
 
 /// change data segment size
