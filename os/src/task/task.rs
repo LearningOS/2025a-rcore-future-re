@@ -9,7 +9,7 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::cell::RefMut;
 
-pub const BIG_STRIDE: usize = 1 << 20; // 1048576
+pub const BIG_STRIDE: usize = 1 << 16;
 
 /// Task control block structure
 ///
@@ -96,16 +96,17 @@ impl TaskControlBlockInner {
     pub fn init_stride_fields(&mut self) {
         self.priority = 16;
         self.stride = 0;
-        self.pass = BIG_STRIDE / self.priority;
+        self.pass = (BIG_STRIDE / self.priority).max(1);
     }
 
     pub fn set_priority(&mut self, prio: usize) -> bool {
-        if prio < 2 {
+        // priority must be >=2 and small enough so BIG_STRIDE/prio != 0
+        if prio < 2 || prio > BIG_STRIDE {
             return false;
         }
         self.priority = prio;
         // recompute pass; avoid zero
-        self.pass = BIG_STRIDE / self.priority;
+        self.pass = (BIG_STRIDE / self.priority).max(1);
         true
     }
 }
@@ -137,7 +138,7 @@ impl TaskControlBlock {
                     task_status: TaskStatus::Ready,
                     priority: 16,
                     stride: 0,
-                    pass: BIG_STRIDE / 16,
+                    pass: (BIG_STRIDE / 16).max(1),
                     memory_set,
                     parent: None,
                     children: Vec::new(),
@@ -213,7 +214,7 @@ impl TaskControlBlock {
                     task_status: TaskStatus::Ready,
                     priority: parent_inner.priority,
                     stride: 0,
-                    pass: BIG_STRIDE / parent_inner.priority,
+                    pass: (BIG_STRIDE / parent_inner.priority).max(1),
                     memory_set,
                     parent: Some(Arc::downgrade(self)),
                     children: Vec::new(),
