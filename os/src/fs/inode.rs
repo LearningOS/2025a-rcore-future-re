@@ -5,9 +5,10 @@
 //! `UPSafeCell<OSInodeInner>` -> `OSInode`: for static `ROOT_INODE`,we
 //! need to wrap `OSInodeInner` into `UPSafeCell`
 use super::File;
-use crate::drivers::BLOCK_DEVICE;
+use crate::fs::StatMode;
 use crate::mm::UserBuffer;
 use crate::sync::UPSafeCell;
+use crate::{drivers::BLOCK_DEVICE, fs::Stat};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use bitflags::*;
@@ -69,6 +70,32 @@ pub fn list_apps() {
         println!("{}", app);
     }
     println!("**************/");
+}
+
+/// Create a hard link in the root directory.
+/// Returns true on success, false on error.
+pub fn link_file(old: &str, new: &str) -> bool {
+    if old == new {
+        return false;
+    }
+    if let Some(src) = ROOT_INODE.find(old) {
+        // if destination already exists, treat as error
+        if ROOT_INODE.find(new).is_some() {
+            return false;
+        }
+        ROOT_INODE.link(new, &src)
+    } else {
+        false
+    }
+}
+
+/// Remove a hard link in the root directory.
+/// Returns true on success, false on error (e.g., not found).
+pub fn unlink_file(name: &str) -> bool {
+    if ROOT_INODE.find(name).is_none() {
+        return false;
+    }
+    ROOT_INODE.unlink(name)
 }
 
 bitflags! {
@@ -155,5 +182,21 @@ impl File for OSInode {
             total_write_size += write_size;
         }
         total_write_size
+    }
+    fn stat(&self, st: &mut Stat) -> bool {
+        // clone inner inode to avoid holding borrow while querying
+        let inode = {
+            let inner = self.inner.exclusive_access();
+            inner.inode.clone()
+        };
+        st.dev = 0;
+        st.ino = inode.inode_id() as u64;
+        st.mode = if inode.is_dir() {
+            StatMode::DIR
+        } else {
+            StatMode::FILE
+        };
+        st.nlink = inode.link_count();
+        true
     }
 }

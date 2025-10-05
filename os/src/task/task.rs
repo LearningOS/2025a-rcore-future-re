@@ -94,6 +94,16 @@ impl TaskControlBlockInner {
         self.get_status() == TaskStatus::Zombie
     }
 
+    pub fn alloc_fd(&mut self) -> usize {
+        if let Some(pos) = self.fd_table.iter().position(|e| e.is_none()) {
+            pos
+        } else {
+            let pos = self.fd_table.len();
+            self.fd_table.push(None);
+            pos
+        }
+    }
+
     pub fn init_stride_fields(&mut self) {
         self.priority = 16;
         self.stride = 0;
