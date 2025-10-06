@@ -1,6 +1,8 @@
+use core::mem::size_of;
+
 use crate::{
     fs::{open_file, OpenFlags},
-    mm::{translated_ref, translated_refmut, translated_str},
+    mm::{translated_byte_buffer, translated_ref, translated_refmut, translated_str},
     task::{
         current_process, current_task, current_user_token, exit_current_and_run_next, pid2process,
         suspend_current_and_run_next, SignalFlags,
@@ -152,33 +154,154 @@ pub fn sys_kill(pid: usize, signal: u32) -> isize {
 /// HINT: You might reimplement it with virtual memory management.
 /// HINT: What if [`TimeVal`] is splitted by two pages ?
 pub fn sys_get_time(_ts: *mut TimeVal, _tz: usize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_get_time NOT IMPLEMENTED",
-        current_task().unwrap().process.upgrade().unwrap().getpid()
-    );
-    -1
+    // snapshot time (microseconds)
+    let usec_total = crate::timer::get_time_us();
+    let sec = usec_total / 1_000_000;
+    let usec = (usec_total % 1_000_000) as usize;
+    let local = TimeVal { sec, usec };
+
+    // build byte slice of local struct
+    let src = unsafe {
+        core::slice::from_raw_parts(
+            (&local as *const TimeVal) as *const u8,
+            size_of::<TimeVal>(),
+        )
+    };
+
+    // fast path: if TimeVal does not cross a page, write as a typed struct
+    let token = current_user_token();
+    let size = size_of::<TimeVal>();
+    let start = _ts as usize;
+    let end = start + size - 1;
+    let page_size = crate::config::PAGE_SIZE;
+    let same_page = (start / page_size) == (end / page_size);
+    if same_page {
+        let dst: &mut TimeVal = translated_refmut(token, _ts);
+        *dst = local;
+    } else {
+        // cross-page: fall back to byte-slice copy
+        let mut dst_slices = translated_byte_buffer(token, _ts as *const u8, size_of::<TimeVal>());
+        let mut copied = 0usize;
+        for slice in dst_slices.iter_mut() {
+            let n = slice.len();
+            slice.copy_from_slice(&src[copied..copied + n]);
+            copied += n;
+        }
+    }
+
+    0
 }
 
 /// mmap syscall
 ///
 /// YOUR JOB: Implement mmap.
 pub fn sys_mmap(_start: usize, _len: usize, _port: usize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_mmap NOT IMPLEMENTED",
-        current_task().unwrap().process.upgrade().unwrap().getpid()
-    );
-    -1
+    trace!("kernel:pid[{}] sys_mmap", current_process().getpid());
+    // validate _port: only R(1),W(2),X(4) allowed and not zero
+    if (_port & !0x7) != 0 || _port == 0 {
+        return -1;
+    }
+
+    // require page-aligned start (simple policy)
+    if !crate::mm::VirtAddr::from(_start).aligned() {
+        return -1;
+    }
+
+    // round up length to page size
+    let page_size = crate::config::PAGE_SIZE;
+    let len_up = if _len == 0 {
+        0
+    } else {
+        ((_len - 1) / page_size + 1) * page_size
+    };
+    if len_up == 0 {
+        return -1;
+    }
+    let end = match _start.checked_add(len_up) {
+        Some(e) => e,
+        None => return -1,
+    };
+
+    // check no existing mapping overlaps (use a snapshot of current page table)
+    let page_table = crate::mm::PageTable::from_token(current_user_token());
+    let mut va = _start;
+    while va < end {
+        let vpn = crate::mm::VirtAddr::from(va).floor();
+        if let Some(pte) = page_table.translate(vpn) {
+            if pte.is_valid() {
+                return -1;
+            }
+        }
+        va += page_size;
+    }
+
+    // build MapPermission (always include user bit)
+    let mut perm = crate::mm::MapPermission::U;
+    if (_port & 0x1) != 0 {
+        perm |= crate::mm::MapPermission::R;
+    }
+    if (_port & 0x2) != 0 {
+        perm |= crate::mm::MapPermission::W;
+    }
+    if (_port & 0x4) != 0 {
+        perm |= crate::mm::MapPermission::X;
+    }
+
+    // perform mapping in current process's MemorySet
+    let process = current_process();
+    let mut proc_inner = process.inner_exclusive_access();
+    proc_inner
+        .memory_set
+        .insert_framed_area(_start.into(), end.into(), perm);
+    // Do not switch satp here; trap_return will load user satp and flush TLB
+    0
 }
 
 /// munmap syscall
 ///
 /// YOUR JOB: Implement munmap.
 pub fn sys_munmap(_start: usize, _len: usize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_munmap NOT IMPLEMENTED",
-        current_task().unwrap().process.upgrade().unwrap().getpid()
-    );
-    -1
+    // require page-aligned start
+    if !crate::mm::VirtAddr::from(_start).aligned() {
+        return -1;
+    }
+
+    // round up length to page size
+    let page_size = crate::config::PAGE_SIZE;
+    let len_up = if _len == 0 {
+        0
+    } else {
+        ((_len - 1) / page_size + 1) * page_size
+    };
+    if len_up == 0 {
+        return -1;
+    }
+    let end = match _start.checked_add(len_up) {
+        Some(e) => e,
+        None => return -1,
+    };
+
+    // verify range is fully mapped in current page table snapshot
+    let page_table = crate::mm::PageTable::from_token(current_user_token());
+    let mut va = _start;
+    while va < end {
+        let vpn = crate::mm::VirtAddr::from(va).floor();
+        match page_table.translate(vpn) {
+            Some(pte) if pte.is_valid() => {}
+            _ => return -1,
+        }
+        va += page_size;
+    }
+
+    // perform unmap in current process's MemorySet
+    let process = current_process();
+    let mut proc_inner = process.inner_exclusive_access();
+
+    // remove the mapping area that starts at _start; tests only unmap full areas
+    let start_vpn = crate::mm::VirtAddr::from(_start).floor();
+    proc_inner.memory_set.remove_area_with_start_vpn(start_vpn);
+
+    0
 }
 
 /// change data segment size
@@ -193,21 +316,38 @@ pub fn sys_munmap(_start: usize, _len: usize) -> isize {
 /// spawn syscall
 /// YOUR JOB: Implement spawn.
 /// HINT: fork + exec =/= spawn
-pub fn sys_spawn(_path: *const u8) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_spawn NOT IMPLEMENTED",
-        current_task().unwrap().process.upgrade().unwrap().getpid()
-    );
-    -1
+pub fn sys_spawn(path: *const u8) -> isize {
+    trace!("kernel:pid[{}] sys_spawn", current_process().getpid());
+    // get path string from user space
+    let token = current_user_token();
+    let path = translated_str(token, path);
+    // find program data
+    if let Some(app_inode) = open_file(path.as_str(), OpenFlags::RDONLY) {
+        let data = app_inode.read_all();
+        let parent = current_process();
+        // create child by forking current process (copy PCB/MemorySet/etc.)
+        let child = parent.fork();
+        // replace child's address space with target program
+        child.exec(data.as_slice(), Vec::new());
+        child.getpid() as isize
+    } else {
+        -1
+    }
 }
 
 /// set priority syscall
 ///
 /// YOUR JOB: Set task priority
-pub fn sys_set_priority(_prio: isize) -> isize {
+pub fn sys_set_priority(prio: isize) -> isize {
     trace!(
-        "kernel:pid[{}] sys_set_priority NOT IMPLEMENTED",
-        current_task().unwrap().process.upgrade().unwrap().getpid()
+        "kernel:pid[{}] sys_set_priority request {}",
+        current_process().getpid(),
+        prio
     );
-    -1
+    if prio < 2 {
+        return -1;
+    }
+    let process = current_process();
+    process.inner_exclusive_access().priority = prio as usize;
+    prio
 }

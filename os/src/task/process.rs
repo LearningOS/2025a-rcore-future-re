@@ -5,6 +5,7 @@ use super::manager::insert_into_pid2process;
 use super::TaskControlBlock;
 use super::{add_task, SignalFlags};
 use super::{pid_alloc, PidHandle};
+use alloc::collections::BTreeMap;
 use crate::fs::{File, Stdin, Stdout};
 use crate::mm::{translated_refmut, MemorySet, KERNEL_SPACE};
 use crate::sync::{Condvar, Mutex, Semaphore, UPSafeCell};
@@ -39,6 +40,18 @@ pub struct ProcessControlBlockInner {
     pub fd_table: Vec<Option<Arc<dyn File + Send + Sync>>>,
     /// signal flags
     pub signals: SignalFlags,
+    /// scheduling priority (larger value -> higher weight)
+    pub priority: usize,
+    /// deadlock detection enabled
+    pub deadlock_detect: bool,
+    /// per-mutex current holder tid (aligned to `mutex_list`)
+    pub mutex_holder: Vec<Option<usize>>,
+    /// per-tid waiting mutex id
+    pub mutex_waiting: BTreeMap<usize, usize>,
+    /// per-semaphore holders: sem_id -> map(tid -> count)
+    pub sem_holders: Vec<BTreeMap<usize, usize>>,
+    /// per-tid waiting semaphore id
+    pub sem_waiting: BTreeMap<usize, usize>,
     /// tasks(also known as threads)
     pub tasks: Vec<Option<Arc<TaskControlBlock>>>,
     /// task resource allocator
@@ -114,6 +127,12 @@ impl ProcessControlBlock {
                         Some(Arc::new(Stdout)),
                     ],
                     signals: SignalFlags::empty(),
+                    priority: 16,
+                    deadlock_detect: false,
+                    mutex_holder: Vec::new(),
+                    mutex_waiting: BTreeMap::new(),
+                    sem_holders: Vec::new(),
+                    sem_waiting: BTreeMap::new(),
                     tasks: Vec::new(),
                     task_res_allocator: RecycleAllocator::new(),
                     mutex_list: Vec::new(),
@@ -228,6 +247,7 @@ impl ProcessControlBlock {
                 new_fd_table.push(None);
             }
         }
+        let parent_priority = parent.priority;
         // create child process pcb
         let child = Arc::new(Self {
             pid,
@@ -240,6 +260,12 @@ impl ProcessControlBlock {
                     exit_code: 0,
                     fd_table: new_fd_table,
                     signals: SignalFlags::empty(),
+                    priority: parent_priority,
+                    deadlock_detect: false,
+                    mutex_holder: Vec::new(),
+                    mutex_waiting: BTreeMap::new(),
+                    sem_holders: Vec::new(),
+                    sem_waiting: BTreeMap::new(),
                     tasks: Vec::new(),
                     task_res_allocator: RecycleAllocator::new(),
                     mutex_list: Vec::new(),
